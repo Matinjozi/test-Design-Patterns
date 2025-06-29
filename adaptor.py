@@ -1,284 +1,134 @@
-import jq
-import json
-from baseclass_adaptor import RideAdapter
-from config import Settings
-import asyncpg
 import asyncio
-
-settings = Settings()
-
-
-async def get_connection(settings):
-    return await asyncpg.connect(
-        host=settings.db_host,
-        port=settings.db_port,
-        user=settings.db_user,
-        password=settings.db_password)
+import json
+from abc import ABC, abstractmethod
+from typing import Dict, Any
 
 
-class TapsiAdapter(RideAdapter):
-    def __init__(self, settings):
-        self.settings = settings
-
-    async def adapt(self, response_json):
-        conn = await get_connection(self.settings)
-        try:
-            data = json.loads(response_json)
-
-            prices = jq.compile('.data.categories[].items[].service.prices[].passengerShare').input(data).all()
-
-            unique_prices = list(set(prices))
-            unique_prices.sort()
-
-            if len(unique_prices) >= 3:
-                price_economic = unique_prices[0]
-                price_ordinary = unique_prices[1]
-                price_plus = unique_prices[2]
-
-                await conn.execute(
-                    "INSERT INTO price_tapsi (price_service_ordinary, price_service_economic, price_service_plus) VALUES ($1, $2, $3)",
-                    price_ordinary, price_economic, price_plus)
-
-                return {"ordinary": price_ordinary, "economic": price_economic, "plus": price_plus}
-            else:
-                raise ValueError(f"تعداد قیمت‌های یافت شده کافی نیست: {len(unique_prices)}")
-
-        finally:
-            await conn.close()
+class RideAdapter(ABC):
+    @abstractmethod
+    async def adapt(self, response_json: str) -> Dict[str, Any]:
+        pass
 
 
+class TapsiPriceAdapter(RideAdapter):
+    async def adapt(self, response_json: str) -> Dict[str, Any]:
+        data = json.loads(response_json)
+        services_info = []
+
+        categories = data.get('data', {}).get('categories', [])
+        for category in categories:
+            category_title = category.get('title')
+            for item in category.get('items', []):
+                service = item.get('service', {})
+                service_key = service.get('key')
+                for price in service.get('prices', []):
+                    services_info.append({
+                        'category': category_title,
+                        'service': service_key,
+                        'price': price.get('passengerShare')
+                    })
+
+        # حذف تکراری‌ها و نگه داشتن ۳ مورد آخر
+        unique_services = self._remove_duplicates_keep_last_3(services_info)
+
+        return {'services': unique_services}
+
+    def _remove_duplicates_keep_last_3(self, services):
+        """حذف تکراری‌ها بر اساس قیمت با حفظ ترتیب"""
+        # ایجاد دیکشنری با قیمت به عنوان کلید
+        price_to_service = {}
+        for service in services:
+            price_to_service[service['price']] = service
+
+        # تبدیل به لیست و نگه داشتن ۳ مورد آخر
+        unique_services = list(price_to_service.values())
+        return unique_services[-3:]
 
 
-
+# داده تست که از خودت گرفتم
+tapsi_raw = '''{
+  "result": "OK",
+  "data": {
+    "categories": [
+      {
+        "key": "SUGGESTION",
+        "title": "پیشنهادی",
+        "items": [
+          {
+            "service": {
+              "key": "STANDARD",
+              "prices": [{"type": "CERTAIN", "passengerShare": 65000}]
+            }
+          },
+          {
+            "service": {
+              "key": "WAIT_AND_SAVE",
+              "prices": [{"type": "CERTAIN", "passengerShare": 60000}]
+            }
+          },
+          {
+            "service": {
+              "key": "PLUS",
+              "prices": [{"type": "CERTAIN", "passengerShare": 85000}]
+            }
+          }
+        ]
+      },
+      {
+        "key": "NORMAL",
+        "title": "دربستی",
+        "items": [
+          {
+            "service": {
+              "key": "STANDARD",
+              "prices": [{"type": "CERTAIN", "passengerShare": 65000}]
+            }
+          },
+          {
+            "service": {
+              "key": "PLUS",
+              "prices": [{"type": "CERTAIN", "passengerShare": 85000}]
+            }
+          }
+        ]
+      },
+      {
+        "key": "ECONOMIC",
+        "title": "اقتصادی",
+        "items": [
+          {
+            "service": {
+              "key": "WAIT_AND_SAVE",
+              "prices": [{"type": "CERTAIN", "passengerShare": 60000}]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}'''
 
 
 class SnappAdapter(RideAdapter):
-    def __init__(self, settings):
-        self.settings = settings
+    async def adapt(self, response_json: str) -> Dict[str, Any]:
+        data = json.loads(response_json)
+        services_info = []
 
-    async def adapt(self, response_json):
-        conn = await get_connection(self.settings)
-        try:
-            data = json.loads(response_json)
+        prices = data.get('data', {}).get('prices', [])
+        for price_info in prices:
+            service_type = price_info.get('type')
+            final_price = price_info.get('final')
+            is_discounted = price_info.get('is_discounted_price')
+            discounted_text = price_info.get('texts', {}).get('discounted_price', '')
+            services_info.append({
+                'type': service_type,
+                'final_price': final_price,
+                'is_discounted': is_discounted,
+                'discounted_text': discounted_text
+            })
 
-            regular_price = None
-            plus_price = None
+        return {'services': services_info}
 
-            price_options = data.get("data", {}).get("prices", [])
-
-            for service in price_options:
-                service_type = service.get("type")
-                if service_type == "1":
-                    regular_price = service.get("final")
-                elif service_type == "2":
-                    plus_price = service.get("final")
-
-            if regular_price is not None and plus_price is not None:
-                await conn.execute(
-                    "INSERT INTO snapp_prices (regular_price, plus_price) VALUES ($1, $2)",
-                    regular_price,
-                    plus_price
-                )
-                print(f"Inserted into DB: Regular Price = {regular_price}, Plus Price = {plus_price}")
-            else:
-                print("Could not find one or both prices in the response.")
-
-            return {
-                "regular_price": regular_price,
-                "plus_price": plus_price
-            }
-
-        except json.JSONDecodeError:
-            print("Error decoding JSON response.")
-            return None
-        except Exception as e:
-
-            print(f"An error occurred: {e}")
-            return None
-        finally:
-
-            await conn.close()
-
-
-async def get_clean_data(platform, response_json, settings: Settings):
-    adapters = {
-        "tapsi": TapsiAdapter(settings),
-        "snapp": SnappAdapter(settings)
-    }
-    adapter = adapters.get(platform)
-    if adapter:
-        return await adapter.adapt(response_json)  # await اضافه شد
-    else:
-        raise ValueError("پلتفرم پشتیبانی نمی‌شود")
-
-
-# Test data
-tapsi_raw = '''{
- "result": "OK",
- "data": {
-  "token": "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJwcmV2aWV3RGF0YSI6eyJvcmlnaW4iOnsibGF0aXR1ZGUiOjM0LjU3MTMxNDgsImxvbmdpdHVkZSI6NTAuODA4NjY5N30sImRlc3RpbmF0aW9ucyI6W3sibGF0aXR1ZGUiOjM0LjYzMjY2NTcsImxvbmdpdHVkZSI6NTAuODY2NDgyfV0sImhhc1JldHVybiI6ZmFsc2UsIndhaXRpbmdUaW1lIjowfSwicHJpY2VEYXRhIjpbeyJzZXJ2aWNlS2V5IjoiUExVUyIsIm51bWJlck9mUGFzc2VuZ2VycyI6MSwicGFzc2VuZ2VyU2hhcmUiOjg1MDAwfSx7InNlcnZpY2VLZXkiOiJXQUlUX0FORF9TQVZFIiwibnVtYmVyT2ZQYXNzZW5nZXJzIjoxLCJwYXNzZW5nZXJTaGFyZSI6NjAwMDB9LHsic2VydmljZUtleSI6IlNUQU5EQVJEIiwibnVtYmVyT2ZQYXNzZW5nZXJzIjoxLCJwYXNzZW5nZXJTaGFyZSI6NjUwMDB9LHsic2VydmljZUtleSI6IkRFTElWRVJZIiwibnVtYmVyT2ZQYXNzZW5nZXJzIjoxLCJwYXNzZW5nZXJTaGFyZSI6NzUwMDB9LHsic2VydmljZUtleSI6IkJJS0VfREVMSVZFUlkiLCJudW1iZXJPZlBhc3NlbmdlcnMiOjEsInBhc3NlbmdlclNoYXJlIjo1ODAwMH1dLCJ1dWlkIjoiNWU1MjYxNDAtMjgyYS0xMWYwLWEyMzktNzdlOTZkZDk1YWE3IiwiaWF0IjoxNzQ2MjgyMjg4LCJleHAiOjE3NDYyODIzNTgsImF1ZCI6ImRvcm9zaGtlOmFwcCIsImlzcyI6ImRvcm9zaGtlOnNlcnZlciIsInN1YiI6ImRvcm9zaGtlOnRva2VuIn0.wm0BYTBEPDhdpoOoVhWEeF-fyQDKGe8IPxWVRVx99Vkwgssv4zoG1ctfq4y4JnU-poVyAAkiwJITNLRq1Hkz0A",
-  "ttl": 60,
-  "surpriseElement": {
-   "isApplied": false,
-   "isEnabled": false,
-   "rewardId": "0"
-  },
-  "hasReturn": false,
-  "waitingTime": 0,
-  "origin": {
-   "location": {
-    "latitude": 34.5713148,
-    "longitude": 50.8086697
-   },
-   "province": "قم",
-   "city": "قم",
-   "address": "بلوار دانشگاه، نرسیده به میدان میدان علوم، پژوهشگاه حوزه و دانشگاه",
-   "shortAddress": "بلوار دانشگاه، نرسیده به میدان میدان علوم، پژوهشگاه حوزه و دانشگاه"
-  },
-  "destinations": [
-   {
-    "location": {
-     "latitude": 34.6326657,
-     "longitude": 50.866482
-    },
-    "province": "قم",
-    "city": "قم",
-    "address": "بلوار امین، بعد از رسالت، بوستان نجمه",
-    "shortAddress": "بلوار امین، بعد از رسالت، بوستان نجمه"
-   }
-  ],
-  "categories": [
-   {
-    "key": "SUGGESTION",
-    "title": "پیشنهادی",
-    "items": [
-     {
-      "service": {
-       "key": "STANDARD",
-       "isAvailable": true,
-       "disclaimer": "زمان تقریبی رسیدن شما به مقصد ۱۸:۲۰ است. امکان تغییر این زمان در شرایط خاص وجود دارد.",
-       "subtitle": "پایان سفر: ۱۸:۲۰",
-       "prices": [
-        {
-         "type": "CERTAIN",
-         "numberOfPassengers": 1,
-         "passengerShare": 65000,
-         "discount": 0
-        }
-       ],
-       "pickupSuggestions": [],
-       "isAuthenticationRequired": false
-      }
-     },
-     {
-      "service": {
-       "key": "WAIT_AND_SAVE",
-       "isAvailable": true,
-       "disclaimer": "زمان تقریبی رسیدن شما به مقصد متناسب با زمان یافتن سفیر ممکن است تغییر نماید.",
-       "subtitle": "تا ۱۰ دقیقه صبر کنید",
-       "prices": [
-        {
-         "type": "CERTAIN",
-         "numberOfPassengers": 1,
-         "passengerShare": 60000,
-         "discount": 0
-        }
-       ],
-       "pickupSuggestions": [],
-       "isAuthenticationRequired": false
-      }
-     },
-     {
-      "service": {
-       "key": "PLUS",
-       "isAvailable": true,
-       "disclaimer": "زمان تقریبی رسیدن شما به مقصد ۱۸:۲۰ است. امکان تغییر این زمان در شرایط خاص وجود دارد.",
-       "subtitle": "پایان سفر: ۱۸:۲۰",
-       "prices": [
-        {
-         "type": "CERTAIN",
-         "numberOfPassengers": 1,
-         "passengerShare": 85000,
-         "discount": 0
-        }
-       ],
-       "pickupSuggestions": [],
-       "isAuthenticationRequired": false,
-       "notAvailableText": ""
-      }
-     }
-    ]
-   },
-   {
-    "key": "NORMAL",
-    "title": "دربستی",
-    "items": [
-     {
-      "service": {
-       "key": "STANDARD",
-       "isAvailable": true,
-       "disclaimer": "زمان تقریبی رسیدن شما به مقصد ۱۸:۲۰ است. امکان تغییر این زمان در شرایط خاص وجود دارد.",
-       "subtitle": "پایان سفر: ۱۸:۲۰",
-       "prices": [
-        {
-         "type": "CERTAIN",
-         "numberOfPassengers": 1,
-         "passengerShare": 65000,
-         "discount": 0
-        }
-       ],
-       "pickupSuggestions": [],
-       "isAuthenticationRequired": false
-      }
-     },
-     {
-      "service": {
-       "key": "PLUS",
-       "isAvailable": true,
-       "disclaimer": "زمان تقریبی رسیدن شما به مقصد ۱۸:۲۰ است. امکان تغییر این زمان در شرایط خاص وجود دارد.",
-       "subtitle": "پایان سفر: ۱۸:۲۰",
-       "prices": [
-        {
-         "type": "CERTAIN",
-         "numberOfPassengers": 1,
-         "passengerShare": 85000,
-         "discount": 0
-        }
-       ],
-       "pickupSuggestions": [],
-       "isAuthenticationRequired": false,
-       "notAvailableText": ""
-      }
-     }
-    ]
-   },
-   {
-    "key": "ECONOMIC",
-    "title": "اقتصادی",
-    "items": [
-     {
-      "service": {
-       "key": "WAIT_AND_SAVE",
-       "isAvailable": true,
-       "disclaimer": "زمان تقریبی رسیدن شما به مقصد متناسب با زمان یافتن سفیر ممکن است تغییر نماید.",
-       "subtitle": "تا ۱۰ دقیقه صبر کنید",
-       "prices": [
-        {
-         "type": "CERTAIN",
-         "numberOfPassengers": 1,
-         "passengerShare": 60000,
-         "discount": 0
-        }
-       ],
-       "pickupSuggestions": [],
-       "isAuthenticationRequired": false
-      }
-     }
-    ]
-   }
-  ]
- }
-}'''
 
 snapp_raw = '''{
     "status": 200,
@@ -539,14 +389,23 @@ snapp_raw = '''{
 }'''
 
 
-async def main(settings):
-    result = await get_clean_data("tapsi", tapsi_raw, settings)
-    print("Tapsi Prices:", result)
+async def main():
+    tapsi_adapter = TapsiPriceAdapter()
+    snapp_adapter = SnappAdapter()
 
-    result = await get_clean_data("snapp", snapp_raw, settings)
-    print("Snapp Prices:", result)
+    # تست آداپتور تپسی
+    tapsi_result = await tapsi_adapter.adapt(tapsi_raw)
+    print("🚗 Tapsi Services (Last 3 Unique Prices):")
+    for service in tapsi_result['services']:
+        print(f"  {service['category']} - {service['service']}: {service['price']:,} تومان")
 
+    print("\n" + "=" * 50 + "\n")
 
-# اجرای اصلی برنامه
-if __name__ == "__main__":
-    asyncio.run(main(settings))
+    # تست آداپتور اسنپ
+    snapp_result = await snapp_adapter.adapt(snapp_raw)
+    print("🚕 Snapp Services:")
+    for service in snapp_result['services']:
+        discount_status = "✅ دارد" if service['is_discounted'] else "❌ ندارد"
+        print(f"  نوع {service['type']}: {service['final_price']:,} تومان - تخفیف: {discount_status}")
+
+asyncio.run(main())
